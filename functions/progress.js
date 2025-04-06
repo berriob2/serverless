@@ -1,11 +1,7 @@
 /**
  * Job progress tracking module
- * 
- * This module provides functions to track and retrieve job progress information.
- * Uses DynamoDB for persistence to ensure job information is maintained across
- * Lambda function invocations.
  */
-import { updateJob as updateDynamoJob, getJob as getDynamoJob } from '../lib/dynamodb.js';
+import { updateJob as updateDynamoJob, getJob as getDynamoJob, listJobs, deleteJob } from '../lib/dynamodb.js'; // Static imports
 
 /**
  * Create a new job or update an existing job
@@ -14,12 +10,13 @@ import { updateJob as updateDynamoJob, getJob as getDynamoJob } from '../lib/dyn
  * @returns {Promise<object>} - Updated job information
  */
 export async function updateJob(jobId, jobInfo) {
-  if (!jobId) {
-    throw new Error('Job ID is required');
-  }
+  if (!jobId) throw new Error('Job ID is required');
   
   try {
-    const updatedJob = await updateDynamoJob(jobId, jobInfo);
+    const updatedJob = await Promise.race([
+      updateDynamoJob(jobId, jobInfo),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DynamoDB timeout')), 5000)) // 5s timeout
+    ]);
     console.log(`Job ${jobId} updated in DynamoDB`);
     return updatedJob;
   } catch (error) {
@@ -34,12 +31,13 @@ export async function updateJob(jobId, jobInfo) {
  * @returns {Promise<object|null>} - Job information or null if not found
  */
 export async function getJob(jobId) {
-  if (!jobId) {
-    throw new Error('Job ID is required');
-  }
+  if (!jobId) throw new Error('Job ID is required');
   
   try {
-    const job = await getDynamoJob(jobId);
+    const job = await Promise.race([
+      getDynamoJob(jobId),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DynamoDB timeout')), 5000)) // 5s timeout
+    ]);
     if (!job) {
       console.warn(`Job ${jobId} not found`);
       return null;
@@ -58,7 +56,10 @@ export async function getJob(jobId) {
  */
 export async function listJobs(options = {}) {
   try {
-    const jobs = await import('../lib/dynamodb.js').then(module => module.listJobs(options));
+    const jobs = await Promise.race([
+      listJobs(options),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DynamoDB timeout')), 5000)) // 5s timeout
+    ]);
     return jobs;
   } catch (error) {
     console.error('Failed to list jobs:', error);
@@ -72,12 +73,13 @@ export async function listJobs(options = {}) {
  * @returns {Promise<boolean>} - True if job was deleted, false if not found
  */
 export async function deleteJob(jobId) {
-  if (!jobId) {
-    throw new Error('Job ID is required');
-  }
+  if (!jobId) throw new Error('Job ID is required');
   
   try {
-    const deleted = await import('../lib/dynamodb.js').then(module => module.deleteJob(jobId));
+    const deleted = await Promise.race([
+      deleteJob(jobId),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DynamoDB timeout')), 5000)) // 5s timeout
+    ]);
     return deleted;
   } catch (error) {
     console.error(`Failed to delete job ${jobId}:`, error);
@@ -92,12 +94,19 @@ export async function deleteJob(jobId) {
  * @returns {Promise<object>} - Response
  */
 export async function handler(event, context) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*', // CORS header for browser access
+    'Cache-Control': 'no-cache'
+  };
+
   try {
     const jobId = event.pathParameters?.jobId;
     
     if (!jobId) {
       return {
         statusCode: 400,
+        headers,
         body: JSON.stringify({ error: 'Job ID is required' })
       };
     }
@@ -107,17 +116,14 @@ export async function handler(event, context) {
     if (!job) {
       return {
         statusCode: 404,
+        headers,
         body: JSON.stringify({ error: 'Job not found' })
       };
     }
     
     return {
       statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*', // CORS header for browser access
-        'Cache-Control': 'no-cache'
-      },
+      headers,
       body: JSON.stringify(job)
     };
   } catch (error) {
@@ -125,9 +131,11 @@ export async function handler(event, context) {
     
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({
         error: 'Failed to retrieve job progress',
-        message: error.message
+        message: error.message,
+        requestId: context.awsRequestId
       })
     };
   }

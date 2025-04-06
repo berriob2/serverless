@@ -15,22 +15,33 @@ const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
  * @returns {Promise<object>} - Response
  */
 export async function handler(event, context) {
+  const headers = {
+    'Content-Type': 'application/json',
+    'Access-Control-Allow-Origin': '*', // CORS header for browser access
+    'Cache-Control': 'no-cache'
+  };
+
   try {
     const { jobId } = event.queryStringParameters || {};
     
     if (!jobId) {
       return {
         statusCode: 400,
+        headers,
         body: JSON.stringify({ error: 'Job ID is required.' })
       };
     }
     
-    // Get job information
-    const job = await getJob(jobId);
+    // Get job information with timeout
+    const job = await Promise.race([
+      getJob(jobId),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Job retrieval timeout')), 5000)) // 5s timeout
+    ]);
     
     if (!job || job.status !== 'completed') {
       return {
         statusCode: 400,
+        headers,
         body: JSON.stringify({ error: 'File not found or not ready' })
       };
     }
@@ -40,39 +51,42 @@ export async function handler(event, context) {
     if (!s3OutputKey) {
       return {
         statusCode: 500,
+        headers,
         body: JSON.stringify({ error: 'Output file information not found' })
       };
     }
     
     // Determine filename based on job context
-    let filename = 'converted_file';
-    if (s3OutputKey.includes('.mp4')) filename = 'video.mp4';
-    else if (s3OutputKey.includes('.mp3')) filename = 'audio.mp3';
-    else if (s3OutputKey.includes('.flac')) filename = 'audio.flac';
-    else if (s3OutputKey.includes('.pdf')) filename = 'document.pdf';
-    else if (s3OutputKey.includes('.docx')) filename = 'document.docx';
-    else if (s3OutputKey.includes('.jpg')) filename = 'image.jpg';
+    const extension = path.extname(s3OutputKey).slice(1);
+    let filename = job.originalName ? `${job.originalName}` : 'converted_file';
     
-    // If job has original filename, use it as a base
-    if (job.originalName) {
-      const extension = path.extname(s3OutputKey).slice(1);
-      filename = `${job.originalName}.${extension}`;
+    // Enhance filename with conversionType if available
+    if (job.conversionType) {
+      switch (job.conversionType) {
+        case 'heic-to-jpg': filename += '_converted'; break;
+        case 'pdf-to-word': filename += '_word'; break;
+        case 'video-to-mp3': filename += '_audio'; break;
+        case 'video': filename += '_converted'; break;
+        case 'image-to-pdf': filename += '_pdf'; break;
+        case 'extract-pdf-pages': filename += '_extracted'; break;
+        case 'remove-pdf-pages': filename += '_trimmed'; break;
+        default: break;
+      }
     }
+    filename += `.${extension}`;
     
-    // Generate pre-signed URL for download
-    const downloadUrl = await getSignedDownloadUrl(s3OutputKey, BUCKET_NAME, 3600, {
-      // Set content disposition to force download with the correct filename
-      ResponseContentDisposition: `attachment; filename="${encodeURIComponent(filename)}"`
-    });
+    // Generate pre-signed URL for download with timeout
+    const downloadUrl = await Promise.race([
+      getSignedDownloadUrl(s3OutputKey, BUCKET_NAME, 3600, {
+        ResponseContentDisposition: `attachment; filename="${encodeURIComponent(filename)}"`
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('S3 URL generation timeout')), 5000)) // 5s timeout
+    ]);
     
     // Return success response with download URL
     return {
       statusCode: 200,
-      headers: {
-        'Content-Type': 'application/json',
-        'Access-Control-Allow-Origin': '*', // CORS header for browser access
-        'Cache-Control': 'no-cache'
-      },
+      headers,
       body: JSON.stringify({
         downloadUrl,
         filename,
@@ -84,9 +98,11 @@ export async function handler(event, context) {
     
     return {
       statusCode: 500,
+      headers,
       body: JSON.stringify({
         error: 'Failed to generate download link',
-        message: error.message
+        message: error.message,
+        requestId: context.awsRequestId
       })
     };
   }

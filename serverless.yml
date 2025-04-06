@@ -11,6 +11,7 @@ provider:
     AWS_BUCKET_NAME: ${self:custom.bucketName}
     TMP_DIR: /tmp
     JOBS_TABLE_NAME: ${self:service}-${self:provider.stage}-jobs
+    STAGE: ${self:provider.stage}
   iam:
     role:
       statements:
@@ -35,6 +36,9 @@ provider:
             - dynamodb:DeleteItem
             - dynamodb:Query
           Resource: arn:aws:dynamodb:*:*:table/${self:service}-${self:provider.stage}-jobs
+        - Effect: Allow
+          Action: ssm:GetParameter
+          Resource: arn:aws:ssm:*:*:parameter/serverless-converter/*
 
 custom:
   bucketName: ${self:service}-${self:provider.stage}-uploads
@@ -48,19 +52,7 @@ functions:
   apiAuthorizer:
     handler: functions/apiAuthorizer.handler
     environment:
-      JWT_SECRET: ${env:JWT_SECRET, 'change-this-secret-in-production'}
-
-  convertPdfToWord:
-    handler: functions/convertPdfToWord.handler
-    events:
-      - http:
-          path: convert/pdf-to-word
-          method: post
-          cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
-          # Add rate limiting to prevent abuse
+      JWT_SECRET: ${env:JWT_SECRET, Add rate limiting to prevent abuse
           throttling:
             burstLimit: 10
             rateLimit: 5
