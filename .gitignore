@@ -1,0 +1,41 @@
+# Serverless directories
+.serverless
+
+# Node dependencies
+node_modules
+
+# Environment variables
+.env
+
+# Temporary files
+tmp
+/tmp
+*.tmp
+
+# Logs
+logs
+*.log
+npm-debug.log*
+
+# OS specific files
+.DS_Store
+Thumbs.db
+
+# IDE files
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Build artifacts
+.build
+dist
+
+# Python artifacts (for PDF to Word conversion)
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/

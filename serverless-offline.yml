@@ -1,0 +1,29 @@
+# Serverless Offline Configuration
+
+service: serverless-converter-local
+
+plugins:
+  - serverless-offline
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: local
+  region: us-east-1
+  environment:
+    AWS_BUCKET_NAME: ${env:AWS_BUCKET_NAME}
+    TMP_DIR: ${env:TMP_DIR}
+    AWS_ACCESS_KEY_ID: ${env:AWS_ACCESS_KEY_ID}
+    AWS_SECRET_ACCESS_KEY: ${env:AWS_SECRET_ACCESS_KEY}
+    AWS_REGION: ${env:AWS_REGION}
+
+custom:
+  serverless-offline:
+    httpPort: 3000
+    lambdaPort: 3002
+    noPrependStageInUrl: true
+    useChildProcesses: true
+
+functions:
+  # Import functions from main serverless.yml
+  ${file(./serverless.yml):functions}

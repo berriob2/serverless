@@ -1,0 +1,188 @@
+service: serverless-converter
+
+provider:
+  name: aws
+  runtime: nodejs18.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  memorySize: 1024
+  timeout: 300 # 5 minutes max timeout
+  environment:
+    AWS_BUCKET_NAME: ${self:custom.bucketName}
+    TMP_DIR: /tmp
+  iam:
+    role:
+      statements:
+        - Effect: Allow
+          Action:
+            - s3:PutObject
+            - s3:GetObject
+            - s3:DeleteObject
+          Resource: arn:aws:s3:::${self:custom.bucketName}/*
+        # Least privilege principle - only allow necessary actions
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: arn:aws:logs:*:*:*
+
+custom:
+  bucketName: ${self:service}-${self:provider.stage}-uploads
+  # Add authorizer configuration
+  authorizers:
+    apiAuthorizer:
+      type: token
+      identitySource: method.request.header.Authorization
+
+functions:
+  apiAuthorizer:
+    handler: functions/apiAuthorizer.handler
+    environment:
+      JWT_SECRET: ${env:JWT_SECRET, 'change-this-secret-in-production'}
+
+  convertPdfToWord:
+    handler: functions/convertPdfToWord.handler
+    events:
+      - http:
+          path: convert/pdf-to-word
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          # Add rate limiting to prevent abuse
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  convertHeicToJpg:
+    handler: functions/convertHeicToJpg.handler
+    events:
+      - http:
+          path: convert/heic-to-jpg
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  convertImageToPdf:
+    handler: functions/convertImageToPdf.handler
+    events:
+      - http:
+          path: convert/image-to-pdf
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  convertVideo:
+    handler: functions/convertVideo.handler
+    events:
+      - http:
+          path: convert/video
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  convertVideoToMp3:
+    handler: functions/convertVideoToMp3.handler
+    events:
+      - http:
+          path: convert/video-to-mp3
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  extractPdfPages:
+    handler: functions/extractPdfPages.handler
+    events:
+      - http:
+          path: convert/extract-pdf-pages
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  removePdfPages:
+    handler: functions/removePdfPages.handler
+    events:
+      - http:
+          path: convert/remove-pdf-pages
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 10
+            rateLimit: 5
+  
+  download:
+    handler: functions/download.handler
+    events:
+      - http:
+          path: download
+          method: get
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 20
+            rateLimit: 10
+  
+  progress:
+    handler: functions/progress.handler
+    events:
+      - http:
+          path: progress/{jobId}
+          method: get
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+          throttling:
+            burstLimit: 20
+            rateLimit: 10
+
+resources:
+  Resources:
+    UploadBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:custom.bucketName}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Api-Key']
+              AllowedMethods: [GET, PUT, POST, DELETE]
+              # Replace with your specific frontend domains in production
+              AllowedOrigins: ['http://localhost:3000', 'https://your-production-domain.com']
+              MaxAge: 3000
+        LifecycleConfiguration:
+          Rules:
+            - Id: DeleteAfter7Days
+              Status: Enabled
+              ExpirationInDays: 7
