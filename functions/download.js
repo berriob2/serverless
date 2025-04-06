@@ -26,7 +26,7 @@ export async function handler(event, context) {
     }
     
     // Get job information
-    const job = getJob(jobId);
+    const job = await getJob(jobId);
     
     if (!job || job.status !== 'completed') {
       return {
