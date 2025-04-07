@@ -21,6 +21,12 @@ ffmpeg.setFmpegPath(ffmpegInstaller.path);
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
 
+const timeoutMs = 10 * 60 * 1000;
+await Promise.race([
+  new Promise((resolve, reject) => ffmpegCommand.on('end', resolve).on('error', reject).save(outputPath)),
+  new Promise((_, reject) => setTimeout(() => reject(new Error('FFmpeg timeout')), timeoutMs))
+]);
+
 /**
  * Convert video to different format
  * @param {object} event - API Gateway event

@@ -96,7 +96,7 @@ All conversion endpoints accept file uploads and return a job ID. The job ID can
 
 ### File Limitations
 
-- **Maximum file size**: 100 MB
+- **Maximum file size: 100 MB (10 MB for PDF-to-Word)
 - **Supported input formats**:
   - PDF: For PDF to Word conversion and PDF page manipulation
   - HEIC: For HEIC to JPG conversion

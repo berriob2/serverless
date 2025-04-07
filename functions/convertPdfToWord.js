@@ -114,7 +114,7 @@ export async function handler(event, context) {
     const processTimeout = setTimeout(() => {
       pythonProcess.kill();
       throw new Error('PDF to Word conversion timed out');
-    }, 240000); // 4 minute timeout
+    }, 600000); // 4 minute timeout
 
     // Process stdout and stderr
     let stdoutData = '';
