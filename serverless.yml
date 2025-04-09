@@ -1,5 +1,4 @@
 service: serverless-converter
-
 provider:
   name: aws
   runtime: nodejs18.x
@@ -52,7 +51,13 @@ functions:
   apiAuthorizer:
     handler: functions/apiAuthorizer.handler
     environment:
-      JWT_SECRET: ${env:JWT_SECRET, Add rate limiting to prevent abuse
+      JWT_SECRET: ${env:JWT_SECRET, ''}
+    # Add rate limiting to prevent abuse
+    events:
+      - http:
+          path: auth
+          method: post
+          cors: true
           throttling:
             burstLimit: 10
             rateLimit: 5

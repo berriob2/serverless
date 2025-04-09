@@ -25,12 +25,12 @@
     "pdf-lib": "^1.17.1",
     "rimraf": "^5.0.1",
     "sharp": "^0.32.5",
-    "uuid": "^9.0.0",
-    "superagent": "^9.0.0"
+    "superagent": "^9.0.0",
+    "uuid": "^9.0.0"
   },
   "devDependencies": {
-    "serverless": "^3.34.0",
-    "serverless-offline": "^12.0.4"
+    "serverless": "^4.12.0",
+    "serverless-offline": "^14.4.0"
   },
   "engines": {
     "node": ">=18.0.0"
