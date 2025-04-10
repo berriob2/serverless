@@ -1,11 +1,18 @@
+org: webapps
+app: converter-dev
 service: serverless-converter
+
 provider:
   name: aws
   runtime: nodejs18.x
   stage: ${opt:stage, 'dev'}
-  region: ${opt:region, 'us-east-1'}
+  region: ${opt:region, 'mx-central-1'}
   memorySize: 2048 # Increased for FFmpeg/LibreOffice tasks
-  timeout: 900 # 15 minutes max timeout for longer conversions
+  timeout: 29 # Initial request timeout (API Gateway limit)
+  apiGateway:
+    minimumCompressionSize: 1024 # Compress responses over 1KB
+    throttlingBurstLimit: 10      # Max concurrent requests
+    throttlingRateLimit: 5        # Requests per second
   environment:
     AWS_BUCKET_NAME: ${self:custom.bucketName}
     TMP_DIR: /tmp
@@ -20,7 +27,6 @@ provider:
             - s3:GetObject
             - s3:DeleteObject
           Resource: arn:aws:s3:::${self:custom.bucketName}/*
-        # Least privilege principle - only allow necessary actions
         - Effect: Allow
           Action:
             - logs:CreateLogGroup
@@ -41,7 +47,6 @@ provider:
 
 custom:
   bucketName: ${self:service}-${self:provider.stage}-uploads
-  # Add authorizer configuration
   authorizers:
     apiAuthorizer:
       type: token
@@ -51,17 +56,14 @@ functions:
   apiAuthorizer:
     handler: functions/apiAuthorizer.handler
     environment:
-      JWT_SECRET: ${env:JWT_SECRET, ''}
-    # Add rate limiting to prevent abuse
+      JWT_SECRET: /serverless-converter/${self:provider.stage}/jwt-secret
     events:
       - http:
           path: auth
           method: post
           cors: true
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
+  # Frontend-facing functions (short-lived, return jobId)
   convertHeicToJpg:
     handler: functions/convertHeicToJpg.handler
     events:
@@ -72,10 +74,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
   convertImageToPdf:
     handler: functions/convertImageToPdf.handler
     events:
@@ -86,10 +85,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
   convertVideo:
     handler: functions/convertVideo.handler
     events:
@@ -100,10 +96,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
   convertVideoToMp3:
     handler: functions/convertVideoToMp3.handler
     events:
@@ -114,10 +107,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
   extractPdfPages:
     handler: functions/extractPdfPages.handler
     events:
@@ -128,10 +118,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
   removePdfPages:
     handler: functions/removePdfPages.handler
     events:
@@ -142,10 +129,18 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 10
-            rateLimit: 5
-  
+
+  convertPdfToWord:
+    handler: functions/convertPdfToWord.handler
+    events:
+      - http:
+          path: convert/pdf-to-word
+          method: post
+          cors: true
+          authorizer:
+            name: apiAuthorizer
+            type: token
+
   download:
     handler: functions/download.handler
     events:
@@ -156,10 +151,7 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 20
-            rateLimit: 10
-  
+
   progress:
     handler: functions/progress.handler
     events:
@@ -170,9 +162,88 @@ functions:
           authorizer:
             name: apiAuthorizer
             type: token
-          throttling:
-            burstLimit: 20
-            rateLimit: 10
+
+  # Background processing functions (long-running)
+  processHeicToJpg:
+    handler: functions/processHeicToJpg.handler
+    timeout: 900 # 15 minutes for conversion
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: heic/
+            - suffix: .heic
+
+  processImageToPdf:
+    handler: functions/processImageToPdf.handler
+    timeout: 900
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: images/
+            - suffix: done.txt
+
+  processVideo:
+    handler: functions/processVideo.handler
+    timeout: 900
+    layers:
+      - arn:aws:lambda:mx-central-1:145266761615:layer:ffmpeg:5
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: videos/
+
+  processVideoToMp3:
+    handler: functions/processVideoToMp3.handler
+    timeout: 900
+    layers:
+      - arn:aws:lambda:mx-central-1:145266761615:layer:ffmpeg:5
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: video-to-mp3/
+
+  processExtractPdfPages:
+    handler: functions/processExtractPdfPages.handler
+    timeout: 900
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: pdf/
+            - suffix: .pdf
+
+  processRemovePdfPages:
+    handler: functions/processRemovePdfPages.handler
+    timeout: 900
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: pdf-remove/
+            - suffix: .pdf
+
+  processPdfToWord:
+    handler: functions/processPdfToWord.handler
+    timeout: 900
+    layers:
+      - arn:aws:lambda:mx-central-1:668099181075:layer:AWSLambda-Python38:1
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          rules:
+            - prefix: pdf-to-word/
+            - suffix: .pdf
 
 resources:
   Resources:
@@ -184,7 +255,6 @@ resources:
           CorsRules:
             - AllowedHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Api-Key']
               AllowedMethods: [GET, PUT, POST, DELETE]
-              # Replace with your specific frontend domains in production
               AllowedOrigins: ['http://localhost:3000', 'https://your-production-domain.com']
               MaxAge: 3000
         LifecycleConfiguration:
@@ -194,16 +264,25 @@ resources:
               ExpirationInDays: 7
     
     ConversionJobsTable:
-      Type: AWS::DynamoDB::Table
-      Properties:
-        TableName: ${self:service}-${self:provider.stage}-jobs
-        AttributeDefinitions:
-          - AttributeName: jobId
-            AttributeType: S
+  Type: AWS::DynamoDB::Table
+  Properties:
+    TableName: ${self:service}-${self:provider.stage}-jobs
+    AttributeDefinitions:
+      - AttributeName: jobId
+        AttributeType: S
+      - AttributeName: status
+        AttributeType: S
+    KeySchema:
+      - AttributeName: jobId
+        KeyType: HASH
+    GlobalSecondaryIndexes:
+      - IndexName: StatusIndex
         KeySchema:
-          - AttributeName: jobId
+          - AttributeName: status
             KeyType: HASH
-        BillingMode: PAY_PER_REQUEST
-        TimeToLiveSpecification:
-          AttributeName: expiresAt
-          Enabled: true
+        Projection:
+          ProjectionType: ALL
+    BillingMode: PAY_PER_REQUEST
+    TimeToLiveSpecification:
+      AttributeName: expiresAt
+      Enabled: true

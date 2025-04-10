@@ -3,7 +3,7 @@
  */
 import path from 'path';
 import { getSignedDownloadUrl } from '../lib/s3.js';
-import { getJob } from './progress.js';
+import { getJob } from '../lib/dynamodb.js';
 
 // Configuration
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;

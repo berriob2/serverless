@@ -1,41 +1,29 @@
 /**
- * Convert video to MP3 function
+ * Convert video to MP3 function - Queues the conversion
  */
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
-import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import { fileTypeFromFile } from 'file-type';
-import { parse } from 'lambda-multipart-parser'; // Added for multipart parsing
+import { parse } from 'lambda-multipart-parser';
 
-import { parseTimemark, getDuration, truncateFileName } from '../lib/utils.js';
-import { uploadToS3, downloadFromS3, getSignedDownloadUrl } from '../lib/s3.js';
+import { uploadToS3 } from '../lib/s3.js';
 import { cleanupFiles } from '../lib/cleanup.js';
-import { updateJob, getJob } from '../lib/dynamodb.js';
-
-// Set FFmpeg path
-ffmpeg.setFmpegPath(ffmpegInstaller.path);
+import { updateJob } from '../lib/dynamodb.js';
 
 // Configuration
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
 
 /**
- * Convert video to MP3
+ * Queue video to MP3 conversion
  * @param {object} event - API Gateway event
  * @param {object} context - Lambda context
- * @returns {Promise<object>} - Response
+ * @returns {Promise<object>} - Response with jobId
  */
 export async function handler(event, context) {
-  // Ensure tmp directory exists
-  if (!fs.existsSync(TMP_DIR)) {
-    fs.mkdirSync(TMP_DIR, { recursive: true });
-  }
+  const jobId = uuidv4();
 
   try {
-    console.log('Event received:', JSON.stringify(event, null, 2));
-
     // Parse multipart/form-data from API Gateway event
     const parsedEvent = await parse(event);
     const files = parsedEvent.files;
@@ -54,7 +42,7 @@ export async function handler(event, context) {
     const file = files[0];
 
     // Validate file size (100 MB limit)
-    if (file.size > 100 * 1024 * 1024) {
+    if (file.content.length > 100 * 1024 * 1024) { // Use content length for buffer
       await cleanupFiles(file.path);
       return {
         statusCode: 413,
@@ -63,8 +51,10 @@ export async function handler(event, context) {
       };
     }
 
+    // Validate output format
     const supportedAudioFormats = ['mp3', 'flac', 'wav', 'ogg'];
     if (!supportedAudioFormats.includes(outputFormat)) {
+      await cleanupFiles(file.path);
       return {
         statusCode: 415,
         headers: { 'Content-Type': 'application/json' },
@@ -87,18 +77,6 @@ export async function handler(event, context) {
     const validVideoExtensions = ['mp4', 'mpeg', 'mov', 'avi', 'webm', '3gp', 'flv', 'mkv', 'wmv'];
     const validAudioExtensions = ['mp3', 'wav', 'flac', 'ogg', 'aac', 'm4a'];
     const validExtensions = [...validVideoExtensions, ...validAudioExtensions];
-
-    if (!validExtensions.includes(fileExtension)) {
-      await cleanupFiles(file.path);
-      return {
-        statusCode: 415,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          error: `Unsupported file extension: .${fileExtension}. Please upload a valid video or audio file.`
-        })
-      };
-    }
-
     const detectedType = await fileTypeFromFile(file.path).catch(err => {
       console.error(`Error detecting file type: ${err.message}`);
       return null;
@@ -108,216 +86,76 @@ export async function handler(event, context) {
       'video/mp4', 'video/mpeg', 'video/quicktime', 'video/x-msvideo', 'video/webm',
       'video/3gpp', 'video/x-flv', 'video/x-matroska', 'video/x-ms-wmv', 'audio/x-ms-asf', 'video/x-ms-asf',
     ];
-
     const validAudioMimeTypes = [
       'audio/mpeg', 'audio/mp3', 'audio/wav', 'audio/wave', 'audio/x-wav',
       'audio/flac', 'audio/ogg', 'audio/aac', 'audio/mp4', 'audio/x-m4a'
     ];
-
     const validMimeTypes = [...validVideoMimeTypes, ...validAudioMimeTypes];
-    if (detectedType && !validMimeTypes.includes(detectedType.mime)) {
+
+    if (!validExtensions.includes(fileExtension) || (detectedType && !validMimeTypes.includes(detectedType.mime))) {
       await cleanupFiles(file.path);
       return {
         statusCode: 415,
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          error: `Unsupported media type: ${detectedType.mime}. Please upload a valid video or audio file.`
+          error: 'Unsupported media type. Please upload a valid video or audio file.'
         })
       };
     }
 
-    // Generate job ID and paths
-    const jobId = uuidv4();
-    const safeFilename = truncateFileName(file.filename || 'unknown');
-    const s3InputKey = `${jobId}/input/${safeFilename}`;
-    const localInputPath = `${TMP_DIR}/${jobId}_input.${fileExtension}`;
-    const outputPath = `${TMP_DIR}/${jobId}.${outputFormat}`;
-    const s3OutputKey = `${jobId}/output/${jobId}.${outputFormat}`;
+    // Define S3 key
+    const s3InputKey = `video-to-mp3/${jobId}.${fileExtension}`;
 
-    // Create initial job record
+    // Initialize job in DynamoDB
     await updateJob(jobId, {
       status: 'uploading',
       progress: 0,
-      inputFile: safeFilename,
+      inputFile: file.filename,
       outputFormat,
       quality: validatedQuality,
+      conversionType: 'video-to-mp3',
       s3InputKey,
-      s3OutputKey,
-      fileSize: file.size
+      fileSize: file.content.length
     });
 
-    // Upload input to S3 and download to local path
-    try {
-      await updateJob(jobId, { status: 'uploading', progress: 10 });
-      await uploadToS3(file.path, s3InputKey, BUCKET_NAME);
-      await updateJob(jobId, { status: 'processing', progress: 20 });
-      await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
-    } catch (uploadError) {
-      console.error(`S3 operation failed for job ${jobId}:`, uploadError);
-      await updateJob(jobId, { status: 'failed', error: 'Failed to upload or download file' });
-      await cleanupFiles(file.path);
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Failed to process file. Please try again.' })
-      };
-    }
+    // Upload input to S3
+    await uploadToS3(file.path, s3InputKey, BUCKET_NAME);
 
-    // Get video duration
-    let duration;
-    try {
-      duration = await getDuration(localInputPath, ffmpeg);
-      await updateJob(jobId, { duration, progress: 25 });
-    } catch (durationError) {
-      console.error(`Failed to get duration for job ${jobId}:`, durationError);
-      await updateJob(jobId, { status: 'failed', error: 'Failed to analyze media file' });
-      await cleanupFiles(localInputPath, file.path);
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Failed to analyze media file. The file may be corrupted.' })
-      };
-    }
+    // Update job to processing
+    await updateJob(jobId, { status: 'processing', progress: 10 });
 
-    // Convert video to audio with quality settings
-    await new Promise((resolve, reject) => {
-      let ffmpegCommand = ffmpeg(localInputPath).format(outputFormat);
+    // Clean up local file
+    await cleanupFiles(file.path);
 
-      // Apply quality settings
-      switch (validatedQuality) {
-        case 'low':
-          ffmpegCommand.audioBitrate('64k');
-          break;
-        case 'high':
-          ffmpegCommand.audioBitrate('256k');
-          break;
-        case 'medium':
-        default:
-          ffmpegCommand.audioBitrate('128k');
-          break;
-      }
-
-      ffmpegCommand
-        .audioChannels(2)
-        .audioFrequency(44100)
-        .on('start', (commandLine) => {
-          console.log(`Job ${jobId}: FFmpeg command: ${commandLine}`);
-          updateJob(jobId, {
-            status: 'processing',
-            progress: 30,
-            commandLine
-          }).catch(err => console.error(`Failed to update job start status: ${err}`));
-        })
-        .on('progress', async (progress) => {
-          try {
-            const currentTime = parseTimemark(progress.timemark);
-            const percent = 30 + Math.min((currentTime / duration) * 60, 60); // Scale from 30% to 90%
-            console.log(`Job ${jobId}: Progress ${percent.toFixed(1)}% (${progress.timemark} / ${duration.toFixed(1)}s)`);
-            await updateJob(jobId, { progress, currentTime });
-          } catch (progressError) {
-            console.warn(`Failed to update progress for job ${jobId}:`, progressError);
-          }
-        })
-        .on('end', async () => {
-          console.log(`Job ${jobId}: Conversion completed`);
-          try {
-            await updateJob(jobId, { status: 'completed', progress: 90 });
-            resolve();
-          } catch (endError) {
-            console.error(`Failed to update job completion status: ${endError}`);
-            resolve(); // Continue despite update failure
-          }
-        })
-        .on('error', async (err) => {
-          console.error(`Job ${jobId}: FFmpeg Error - ${err}`);
-          await updateJob(jobId, { status: 'failed', error: err.message });
-          reject(err);
-        })
-        .save(outputPath);
-    }).catch(async (conversionError) => {
-      console.error(`Conversion failed for job ${jobId}:`, conversionError);
-      await cleanupFiles(localInputPath, outputPath, file.path);
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Failed to convert media file. Please try again.' })
-      };
-    });
-
-    // Upload output to S3
-    try {
-      await updateJob(jobId, { status: 'uploading', progress: 95 });
-      await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
-
-      // Generate a pre-signed URL for immediate download
-      const downloadUrl = await getSignedDownloadUrl(s3OutputKey, BUCKET_NAME, 3600);
-
-      // Update job with final status and download URL
-      await updateJob(jobId, {
-        status: 'completed',
-        progress: 100,
-        downloadUrl,
-        completedAt: new Date().toISOString()
-      });
-
-      // Clean up local files
-      await cleanupFiles(localInputPath, outputPath, file.path);
-
-      // Get the complete job information to return
-      const jobInfo = await getJob(jobId);
-
-      return {
-        statusCode: 200,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jobId,
-          status: 'completed',
-          downloadUrl,
-          s3OutputKey,
-          outputFormat,
-          quality: validatedQuality,
-          duration: jobInfo?.duration || duration
-        })
-      };
-    } catch (finalError) {
-      console.error(`Final processing failed for job ${jobId}:`, finalError);
-      await updateJob(jobId, { status: 'failed', error: 'Failed to upload converted file', progress: 0 })
-        .catch(err => console.error(`Failed to update final error status: ${err}`));
-      await cleanupFiles(localInputPath, outputPath, file.path);
-      return {
-        statusCode: 500,
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ error: 'Failed to complete conversion process. Please try again.' })
-      };
-    }
+    return {
+      statusCode: 202, // Accepted, processing will continue in background
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jobId, status: 'processing' })
+    };
   } catch (error) {
-    console.error(`Unhandled error in convertVideoToMp3: ${error.message}`);
-    console.error(error.stack);
+    console.error(`Error queuing job ${jobId}: ${error.message}`);
 
     // Update job status if jobId exists
-    if (typeof jobId !== 'undefined') {
+    if (jobId) {
       await updateJob(jobId, {
         status: 'failed',
-        error: 'Internal server error',
-        errorDetails: error.message,
+        error: error.message,
         progress: 0
       }).catch(err => console.error(`Failed to update error status: ${err}`));
     }
 
-    // Clean up any files that might exist
+    // Clean up if file exists
     try {
-      if (typeof localInputPath !== 'undefined') await cleanupFiles(localInputPath);
-      if (typeof outputPath !== 'undefined') await cleanupFiles(outputPath);
-      if (typeof file !== 'undefined' && file.path) await cleanupFiles(file.path);
+      if (file && file.path) await cleanupFiles(file.path);
     } catch (cleanupError) {
-      console.error(`Failed to clean up files: ${cleanupError}`);
+      console.error(`Cleanup failed: ${cleanupError}`);
     }
 
     return {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        error: 'Failed to convert video to audio due to an internal server error.',
+        error: 'Failed to queue video to MP3 conversion.',
         requestId: context.awsRequestId
       })
     };

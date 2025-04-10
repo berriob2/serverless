@@ -1,43 +1,27 @@
 /**
- * Convert video to different formats function
+ * Convert video to different formats function - Queues the conversion
  */
-import ffmpeg from 'fluent-ffmpeg';
-import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
-import fs from 'fs';
 import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import { fileTypeFromFile } from 'file-type';
-import { parse } from 'lambda-multipart-parser'; // Added for multipart parsing
+import { parse } from 'lambda-multipart-parser';
 
-import { parseTimemark, getDuration } from '../lib/utils.js';
-import { uploadToS3, downloadFromS3 } from '../lib/s3.js';
+import { uploadToS3 } from '../lib/s3.js';
 import { cleanupFiles } from '../lib/cleanup.js';
-import { updateJob } from '../lib/dynamodb.js'; // Added for consistent job tracking
-
-// Set FFmpeg path
-ffmpeg.setFmpegPath(ffmpegInstaller.path);
+import { updateJob } from '../lib/dynamodb.js';
 
 // Configuration
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
 
-const timeoutMs = 10 * 60 * 1000;
-await Promise.race([
-  new Promise((resolve, reject) => ffmpegCommand.on('end', resolve).on('error', reject).save(outputPath)),
-  new Promise((_, reject) => setTimeout(() => reject(new Error('FFmpeg timeout')), timeoutMs))
-]);
-
 /**
- * Convert video to different format
+ * Queue video conversion to different format
  * @param {object} event - API Gateway event
  * @param {object} context - Lambda context
- * @returns {Promise<object>} - Response
+ * @returns {Promise<object>} - Response with jobId
  */
 export async function handler(event, context) {
-  // Ensure tmp directory exists
-  if (!fs.existsSync(TMP_DIR)) {
-    fs.mkdirSync(TMP_DIR, { recursive: true });
-  }
+  const jobId = uuidv4();
 
   try {
     // Parse multipart/form-data from API Gateway event
@@ -57,7 +41,7 @@ export async function handler(event, context) {
     const file = files[0];
 
     // Validate file size (100 MB limit)
-    if (file.size > 100 * 1024 * 1024) {
+    if (file.content.length > 100 * 1024 * 1024) { // Use content length for buffer
       await cleanupFiles(file.path);
       return {
         statusCode: 413,
@@ -66,8 +50,10 @@ export async function handler(event, context) {
       };
     }
 
+    // Validate output format
     const supportedFormats = ['mp4', 'avi', 'mov', 'webm', 'wmv', '3gp', 'flv'];
     if (!supportedFormats.includes(outputFormat)) {
+      await cleanupFiles(file.path);
       return {
         statusCode: 415,
         headers: { 'Content-Type': 'application/json' },
@@ -98,13 +84,8 @@ export async function handler(event, context) {
       };
     }
 
-    // Generate job ID and paths
-    const jobId = uuidv4();
-    const s3InputKey = `${jobId}/input/${file.filename}`;
-    const localInputPath = `${TMP_DIR}/${jobId}_input.${fileExtension}`;
-    const outputPath = `${TMP_DIR}/${jobId}.${outputFormat}`;
-    const s3OutputKey = `${jobId}/output/${jobId}.${outputFormat}`;
-    const originalName = path.basename(file.filename, path.extname(file.filename));
+    // Define S3 key
+    const s3InputKey = `videos/${jobId}.${fileExtension}`;
 
     // Initialize job in DynamoDB
     await updateJob(jobId, {
@@ -112,87 +93,29 @@ export async function handler(event, context) {
       progress: 0,
       inputFile: file.filename,
       outputFormat,
-      conversionType: 'video'
-    });
-
-    // Upload input to S3 and download to local path
-    await uploadToS3(file.path, s3InputKey, BUCKET_NAME);
-    await updateJob(jobId, { status: 'processing', progress: 20 });
-    await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
-
-    // Get video duration
-    const duration = await getDuration(localInputPath, ffmpeg);
-    await updateJob(jobId, { duration, progress: 25 });
-
-    // Convert video
-    await new Promise((resolve, reject) => {
-      let ffmpegCommand = ffmpeg(localInputPath);
-
-      if (outputFormat === '3gp') {
-        ffmpegCommand
-          .videoCodec('h263')
-          .size('176x144')
-          .videoBitrate('128k')
-          .audioCodec('aac')
-          .audioBitrate('64k');
-      } else {
-        ffmpegCommand
-          .videoCodec('libx264')
-          .audioCodec('aac');
-      }
-
-      ffmpegCommand
-        .format(outputFormat)
-        .on('start', (commandLine) => {
-          console.log(`Job ${jobId}: FFmpeg command: ${commandLine}`);
-          updateJob(jobId, { commandLine }).catch(err => console.error(`Failed to update command: ${err}`));
-        })
-        .on('progress', async (progress) => {
-          const currentTime = parseTimemark(progress.timemark);
-          const percent = 25 + Math.min((currentTime / duration) * 65, 65); // Scale from 25% to 90%
-          console.log(`Job ${jobId}: Progress ${percent.toFixed(1)}%`);
-          await updateJob(jobId, { progress, currentTime }).catch(err => console.error(`Progress update failed: ${err}`));
-        })
-        .on('end', () => {
-          console.log(`Job ${jobId}: Conversion completed`);
-          resolve();
-        })
-        .on('error', (err) => {
-          console.error(`Job ${jobId}: FFmpeg Error - ${err}`);
-          reject(err);
-        })
-        .save(outputPath);
-    });
-
-    // Upload output to S3
-    await updateJob(jobId, { status: 'uploading', progress: 95 });
-    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
-
-    // Update job progress to completed
-    await updateJob(jobId, {
-      jobId,
-      status: 'completed',
-      progress: 100,
-      s3OutputKey,
-      originalName,
       conversionType: 'video',
-      completedAt: new Date().toISOString()
+      s3InputKey,
     });
 
-    // Clean up local files
-    await cleanupFiles(localInputPath, outputPath, file.path);
+    // Upload input to S3
+    await uploadToS3(file.path, s3InputKey, BUCKET_NAME);
+
+    // Update job to processing
+    await updateJob(jobId, { status: 'processing', progress: 10 });
+
+    // Clean up local file
+    await cleanupFiles(file.path);
 
     return {
-      statusCode: 200,
+      statusCode: 202, // Accepted, processing will continue in background
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jobId })
+      body: JSON.stringify({ jobId, status: 'processing' })
     };
   } catch (error) {
-    console.error(`Error in job ${jobId || 'unknown'}: ${error.message}`);
-    console.error(error.stack);
+    console.error(`Error queuing job ${jobId}: ${error.message}`);
 
     // Update job status if jobId exists
-    if (typeof jobId !== 'undefined') {
+    if (jobId) {
       await updateJob(jobId, {
         status: 'failed',
         error: error.message,
@@ -200,11 +123,9 @@ export async function handler(event, context) {
       }).catch(err => console.error(`Failed to update error status: ${err}`));
     }
 
-    // Clean up any files that might exist
+    // Clean up if file exists
     try {
-      if (typeof localInputPath !== 'undefined') await cleanupFiles(localInputPath);
-      if (typeof outputPath !== 'undefined') await cleanupFiles(outputPath);
-      if (typeof file !== 'undefined' && file.path) await cleanupFiles(file.path);
+      if (file && file.path) await cleanupFiles(file.path);
     } catch (cleanupError) {
       console.error(`Cleanup failed: ${cleanupError}`);
     }
@@ -213,7 +134,7 @@ export async function handler(event, context) {
       statusCode: 500,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        error: 'Failed to convert video.',
+        error: 'Failed to queue video conversion.',
         requestId: context.awsRequestId
       })
     };

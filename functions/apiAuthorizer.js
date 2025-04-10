@@ -9,7 +9,7 @@ import jwt from 'jsonwebtoken';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 
 // Initialize SSM client
-const ssmClient = new SSMClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const ssmClient = new SSMClient({ region: process.env.AWS_REGION || 'mx-central-1' });
 
 // Cache for JWT secret to optimize cold starts
 let JWT_SECRET;
