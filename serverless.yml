@@ -1,15 +1,21 @@
 org: webapps
-app: converter-dev
+app: convertidor-mx
 service: serverless-converter
+
+build:
+  esbuild: false  # Disable built-in ESBuild to avoid conflict with serverless-esbuild
+
+plugins:
+ - serverless-esbuild
 
 provider:
   name: aws
   runtime: nodejs18.x
   stage: ${opt:stage, 'dev'}
   region: ${opt:region, 'mx-central-1'}
+  architecture: x86_64  # Explicitly set to match Docker image
   memorySize: 2048
-  timeout: 29
-  ephemeralStorageSize: 1024 # Added for video conversions
+  timeout: 300  # Increased for media processing
   apiGateway:
     minimumCompressionSize: 1024
   environment:
@@ -43,137 +49,302 @@ provider:
         - Effect: Allow
           Action: ssm:GetParameter
           Resource: arn:aws:ssm:*:*:parameter/serverless-converter/*
+        - Effect: Allow
+          Action:
+            - ecr:BatchGetImage
+            - ecr:GetDownloadUrlForLayer
+          Resource: arn:aws:ecr:mx-central-1:167603795381:repository/serverless-converter-${self:provider.stage}
+        - Effect: Allow
+          Action:
+            - ecr:BatchCheckLayerAvailability
+            - ecr:CompleteLayerUpload
+            - ecr:InitiateLayerUpload
+            - ecr:PutImage
+            - ecr:UploadLayerPart
+          Resource: arn:aws:ecr:mx-central-1:167603795381:repository/serverless-converter-${self:provider.stage}
+  ecr:
+    scanOnPush: true
+    images:
+      pdf-to-word:
+        path: ./  # Fixed to point to directory
+        platform: linux/amd64  # Ensure x86_64 compatibility
+        buildArgs:
+          STAGE: ${opt:stage, 'dev'}
+          DOCKER_BUILDKIT: 1
+          BUILDKIT_INLINE_CACHE: 1
+        cacheFrom:
+          - public.ecr.aws/lambda/nodejs:18
+        buildOptions:
+          - --provenance=false
 
 custom:
-  bucketName: ${self:service}-${self:provider.stage}-uploads
-  authorizers:
-    apiAuthorizer:
-      type: token
-      identitySource: method.request.header.Authorization
+  bucketName: ${self:service}-${self:provider.stage}-uploads-${self:provider.region}-${aws:accountId}
+  esbuild:
+    bundle: true
+    minify: true
+    sourcemap: false
+    target: es2020
+    platform: node
+    concurrency: 2
+    external:
+      - heic-convert
+      - '@aws-sdk/client-s3'
+      - '@aws-sdk/s3-request-presigner'
+      - '@aws-sdk/client-dynamodb'
+      - '@aws-sdk/lib-dynamodb'
+      - lambda-multipart-parser
+      - '@ffmpeg-installer/ffmpeg'
+      - pdfkit
+      - sharp
+      - pdf-lib
+      - fluent-ffmpeg
+      - fontkit
+      - libheif-js
+      - png-js
+      - brotli
+      - jsonwebtoken
 
 functions:
-  apiAuthorizer:
-    handler: functions/apiAuthorizer.handler
-    environment:
-      JWT_SECRET: ${env:JWT_SECRET, ''}
-    events:
-      - http:
-          path: auth
-          method: post
-          cors: true
-
   convertHeicToJpg:
     handler: functions/convertHeicToJpg.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - http:
           path: convert/heic-to-jpg
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
+
+  convertVideo:
+    handler: functions/convertVideo.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
+    events:
+      - http:
+          path: convert/video-upload
+          method: post
+          cors: true
+
+  convertVideoToMp3:
+    handler: functions/convertVideoToMp3.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
+    events:
+      - http:
+          path: convert/video-to-mp3-upload
+          method: post
+          cors: true
 
   convertImageToPdf:
     handler: functions/convertImageToPdf.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - http:
           path: convert/image-to-pdf
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
-  generateVideoUploadUrl: # Renamed from convertVideo
+  generateVideoUploadUrl:
     handler: functions/generateUploadUrl.handler
-    timeout: 60 # Increased for reliability
+    timeout: 29
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     layers:
-      - arn:aws:lambda:mx-central-1:167603795381:layer:FFmpegLayer:1 # Added (though not strictly needed)
+      - arn:aws:lambda:mx-central-1:167603795381:layer:uuid-dependency:2
     events:
       - http:
           path: convert/video
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
-  generateVideoToMp3UploadUrl: # Renamed from convertVideoToMp3
+  generateVideoToMp3UploadUrl:
     handler: functions/generateUploadUrl.handler
-    timeout: 60 # Increased for reliability
+    timeout: 29
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     layers:
-      - arn:aws:lambda:mx-central-1:167603795381:layer:FFmpegLayer:1 # Added (though not strictly needed)
+      - arn:aws:lambda:mx-central-1:167603795381:layer:uuid-dependency:2
     events:
       - http:
           path: convert/video-to-mp3
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
   extractPdfPages:
     handler: functions/extractPdfPages.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - http:
           path: convert/extract-pdf-pages
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
   removePdfPages:
     handler: functions/removePdfPages.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - http:
           path: convert/remove-pdf-pages
           method: post
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
-
-  convertPdfToWord:
-    handler: functions/convertPdfToWord.handler
-    events:
-      - http:
-          path: convert/pdf-to-word
-          method: post
-          cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
   download:
     handler: functions/download.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     events:
       - http:
           path: download
           method: get
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
   progress:
     handler: functions/progress.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     events:
       - http:
           path: progress/{jobId}
           method: get
           cors: true
-          authorizer:
-            name: apiAuthorizer
-            type: token
 
   processHeicToJpg:
     handler: functions/processHeicToJpg.handler
     timeout: 900
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-heic-depend:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: heic/
             - suffix: .heic
@@ -181,44 +352,106 @@ functions:
   processImageToPdf:
     handler: functions/processImageToPdf.handler
     timeout: 900
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-pdf-image:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: images/
 
   processVideo:
     handler: functions/processVideo.handler
     timeout: 900
+    memorySize: 2048
+    ephemeralStorageSize: 1024
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     layers:
       - arn:aws:lambda:mx-central-1:167603795381:layer:FFmpegLayer:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-video-video2mp3:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: videos/
 
   processVideoToMp3:
     handler: functions/processVideoToMp3.handler
     timeout: 900
+    memorySize: 2048
+    ephemeralStorageSize: 1024
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
     layers:
       - arn:aws:lambda:mx-central-1:167603795381:layer:FFmpegLayer:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-video-video2mp3:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: video-to-mp3/
 
   processExtractPdfPages:
     handler: functions/processExtractPdfPages.handler
     timeout: 900
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-extract-remove-pdf-pages:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: pdf/
             - suffix: .pdf
@@ -226,45 +459,51 @@ functions:
   processRemovePdfPages:
     handler: functions/processRemovePdfPages.handler
     timeout: 900
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-extract-remove-pdf-pages:1
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: pdf-remove/
             - suffix: .pdf
 
   processPdfToWord:
-    handler: functions/processPdfToWord.handler
+    image:
+      name: pdf-to-word
     timeout: 900
-    layers:
-      - arn:aws:lambda:mx-central-1:167603795381:layer:LibreOfficeLayer:1
+    memorySize: 2048
+    architecture: x86_64
+    environment:
+      AWS_BUCKET_NAME: ${self:custom.bucketName}
+      TMP_DIR: /tmp
+      JOBS_TABLE_NAME: ${self:service}-${self:provider.stage}-jobs
     events:
       - s3:
           bucket: ${self:custom.bucketName}
           event: s3:ObjectCreated:*
+          existing: true
           rules:
             - prefix: pdf-to-word/
             - suffix: .pdf
+    ephemeralStorageSize: 1024
 
 resources:
   Resources:
-    UploadBucket:
-      Type: AWS::S3::Bucket
-      Properties:
-        BucketName: ${self:custom.bucketName}
-        CorsConfiguration:
-          CorsRules:
-            - AllowedHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Api-Key']
-              AllowedMethods: [GET, PUT, POST, DELETE]
-              AllowedOrigins: ['http://localhost:3000', 'https://your-production-domain.com']
-              MaxAge: 3000
-        LifecycleConfiguration:
-          Rules:
-            - Id: DeleteAfter7Days
-              Status: Enabled
-              ExpirationInDays: 7
-    
     ConversionJobsTable:
       Type: AWS::DynamoDB::Table
       Properties:
@@ -288,3 +527,8 @@ resources:
         TimeToLiveSpecification:
           AttributeName: expiresAt
           Enabled: true
+
+  Outputs:
+    BucketName:
+      Value: ${self:custom.bucketName}
+      Description: "Name of the S3 bucket"

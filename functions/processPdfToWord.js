@@ -1,28 +1,41 @@
 /**
  * Process PDF to Word conversion in background
  */
-import fs from 'fs';
-import path from 'path';
-import { spawn } from 'child_process';
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+const { S3Client, GetObjectCommand, PutObjectCommand } = require('@aws-sdk/client-s3');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, UpdateCommand } = require('@aws-sdk/lib-dynamodb');
 
-import { uploadToS3, downloadFromS3 } from '../lib/s3.js';
-import { cleanupFiles } from '../lib/cleanup.js';
-import { updateJob } from '../lib/dynamodb.js';
+// Import helper functions
+const s3Helpers = require('../lib/s3.js');
+const { cleanupFiles } = require('../lib/cleanup.js');
+const { updateJob } = require('../lib/dynamodb.js');
 
 // Configuration
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
+
+// Initialize clients
+const s3Client = new S3Client({ region: process.env.AWS_REGION || 'mx-central-1' });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'mx-central-1' });
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 /**
  * Process conversion of PDF to Word triggered by S3 event
  * @param {object} event - S3 event
  * @returns {Promise<object>} - Response
  */
-export async function handler(event) {
+exports.handler = async function(event) {
   const record = event.Records[0];
   const bucket = record.s3.bucket.name;
   const s3InputKey = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
   const jobId = s3InputKey.split('/')[1].split('.')[0]; // e.g., pdf-to-word/<jobId>.pdf
+
+  // Log environment details for debugging
+  console.log('Environment PATH:', process.env.PATH);
+  console.log('Checking python3.8 at /usr/local/bin/python3.8:', fs.existsSync('/usr/local/bin/python3.8'));
 
   // Ensure tmp directory exists
   if (!fs.existsSync(TMP_DIR)) {
@@ -38,15 +51,31 @@ export async function handler(event) {
     await updateJob(jobId, { status: 'processing', progress: 20 });
 
     // Download PDF from S3
-    await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
+    await s3Helpers.downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
 
     // Convert PDF to Word using Python script
     const sanitizedInputPath = path.normalize(localInputPath).replace(/\\+/g, '/').replace(/[\s&;$<>]/g, '');
     const sanitizedOutputPath = path.normalize(outputPath).replace(/\\+/g, '/').replace(/[\s&;$<>]/g, '');
-    const pythonScriptPath = path.resolve(process.cwd(), 'pdf_to_word.py');
-    const pythonProcess = spawn('python3', [pythonScriptPath, sanitizedInputPath, sanitizedOutputPath]);
+    const pythonScriptPath = path.join(process.env.LAMBDA_TASK_ROOT, 'functions/pdf_to_word.py');
 
-    // Set timeout (4 minutes as per original)
+    // Verify Python script exists
+    if (!fs.existsSync(pythonScriptPath)) {
+      throw new Error(`Python script not found at ${pythonScriptPath}`);
+    }
+
+    console.log('Spawning python3.8 with args:', [
+      pythonScriptPath,
+      sanitizedInputPath,
+      sanitizedOutputPath,
+    ]);
+
+    const pythonProcess = spawn('/usr/local/bin/python3.8', [
+      pythonScriptPath,
+      sanitizedInputPath,
+      sanitizedOutputPath,
+    ]);
+
+    // Set timeout (4 minutes)
     const processTimeout = setTimeout(() => {
       pythonProcess.kill();
       throw new Error('PDF to Word conversion timed out');
@@ -63,21 +92,6 @@ export async function handler(event) {
       const message = data.toString();
       stderrData += message;
       console.error(`Job ${jobId} stderr: ${message}`);
-
-      // Parse progress (assuming script logs similar to original)
-      const phaseMatch = message.match(/\[INFO\] \[(\d+)\/4\] (.*?)\.\.\./);
-      const progressMatch = message.match(/\[INFO\] \((\d+)\/(\d+)\) Page \d+/);
-
-      if (phaseMatch) {
-        const phase = parseInt(phaseMatch[1], 10);
-        const progress = 20 + (phase / 4) * 60; // Scale from 20% to 80%
-        updateJob(jobId, { progress }).catch(err => console.error(`Progress update failed: ${err}`));
-      } else if (progressMatch) {
-        const currentPage = parseInt(progressMatch[1], 10);
-        const totalPages = parseInt(progressMatch[2], 10);
-        const pageProgress = (currentPage / totalPages) * 20 + 60; // Scale pages within 60-80%
-        updateJob(jobId, { progress: pageProgress }).catch(err => console.error(`Page progress update failed: ${err}`));
-      }
     });
 
     // Handle process completion
@@ -86,18 +100,24 @@ export async function handler(event) {
         clearTimeout(processTimeout);
         console.log(`Job ${jobId}: Python process exited with code ${code}`);
 
-        if (code !== 0) {
-          console.error(`Job ${jobId}: Conversion failed with code ${code}`);
-          console.error(`stderr: ${stderrData}`);
-          throw new Error(`Conversion failed with code ${code}`);
-        }
+        try {
+          if (code !== 0) {
+            console.error(`Job ${jobId}: Conversion failed with code ${code}`);
+            console.error(`stderr: ${stderrData}`);
+            throw new Error(`Conversion failed with code ${code}`);
+          }
 
-        // Check if output file exists
-        if (!fs.existsSync(outputPath)) {
-          throw new Error('Output file was not created');
-        }
+          // Check if output file exists
+          if (!fs.existsSync(outputPath)) {
+            throw new Error('Output file was not created');
+          }
 
-        resolve();
+          // Update progress after conversion
+          await updateJob(jobId, { progress: 80 });
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
       });
 
       pythonProcess.on('error', (error) => {
@@ -109,7 +129,7 @@ export async function handler(event) {
 
     // Upload output to S3
     await updateJob(jobId, { status: 'uploading', progress: 95 });
-    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
+    await s3Helpers.uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
 
     // Update job to completed
     await updateJob(jobId, {
@@ -118,7 +138,7 @@ export async function handler(event) {
       s3OutputKey,
       originalName: path.basename(s3InputKey, '.pdf'),
       conversionType: 'pdf-to-word',
-      completedAt: new Date().toISOString()
+      completedAt: new Date().toISOString(),
     });
 
     // Clean up local files
@@ -132,7 +152,7 @@ export async function handler(event) {
     await updateJob(jobId, {
       status: 'failed',
       error: error.message,
-      progress: 0
+      progress: 0,
     }).catch(err => console.error(`Failed to update error status: ${err}`));
 
     // Clean up
@@ -142,4 +162,4 @@ export async function handler(event) {
 
     throw error; // Let Lambda retry if needed
   }
-}
+};

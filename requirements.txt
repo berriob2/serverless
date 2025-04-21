@@ -1,7 +1,4 @@
+
 # Python dependencies for serverless-converter
-
-# PDF to Word conversion
-pdf2docx>=0.5.6
-
-# AWS SDK for Python (optional, for direct S3 access from Python)
-boto3>=1.28.0
+pdf2docx>=0.5.8 
+pypdf>=5.0.1

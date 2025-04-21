@@ -3,7 +3,7 @@ const { v4: uuidv4 } = require('uuid');
 const s3 = new AWS.S3();
 const dynamodb = new AWS.DynamoDB.DocumentClient();
 
-exports.handler = async (event) => {
+export const handler = async (event) => {
   const { path } = event.requestContext.http; // e.g., /convert/video or /convert/video-to-mp3
   const jobId = uuidv4();
   const bucket = process.env.AWS_BUCKET_NAME; // serverless-converter-dev-uploads

@@ -5,6 +5,7 @@ import { v4 as uuidv4 } from 'uuid';
 import path from 'path';
 import { fileTypeFromFile } from 'file-type';
 import { parse } from 'lambda-multipart-parser';
+import fs from 'fs/promises'; // Add this import for file system operations
 
 import { uploadToS3 } from '../lib/s3.js';
 import { cleanupFiles } from '../lib/cleanup.js';
@@ -22,6 +23,7 @@ const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
  */
 export async function handler(event, context) {
   const jobId = uuidv4();
+  let tempFilePath = null;
 
   try {
     // Parse multipart/form-data from API Gateway event
@@ -40,8 +42,7 @@ export async function handler(event, context) {
     const file = files[0];
 
     // Validate file size (10 MB limit as per original)
-    if (file.content.length > 10 * 1024 * 1024) { // Use content length for buffer
-      await cleanupFiles(file.path);
+    if (file.content.length > 10 * 1024 * 1024) {
       return {
         statusCode: 413,
         headers: { 'Content-Type': 'application/json' },
@@ -49,13 +50,17 @@ export async function handler(event, context) {
       };
     }
 
+    // Write file to disk for file-type validation
+    tempFilePath = path.join(TMP_DIR, `${jobId}-${file.filename}`);
+    await fs.writeFile(tempFilePath, file.content);
+
     // Validate file type
     const fileExtension = path.extname(file.filename).slice(1).toLowerCase();
-    const detectedType = await fileTypeFromFile(file.path);
+    const detectedType = await fileTypeFromFile(tempFilePath);
     const validPdfMimeTypes = ['application/pdf'];
 
     if (fileExtension !== 'pdf' || !detectedType || !validPdfMimeTypes.includes(detectedType.mime)) {
-      await cleanupFiles(file.path);
+      await cleanupFiles(tempFilePath);
       return {
         statusCode: 415,
         headers: { 'Content-Type': 'application/json' },
@@ -76,16 +81,16 @@ export async function handler(event, context) {
     });
 
     // Upload input to S3
-    await uploadToS3(file.path, s3InputKey, BUCKET_NAME);
+    await uploadToS3(tempFilePath, s3InputKey, BUCKET_NAME);
 
     // Update job to processing
     await updateJob(jobId, { status: 'processing', progress: 10 });
 
     // Clean up local file
-    await cleanupFiles(file.path);
+    await cleanupFiles(tempFilePath);
 
     return {
-      statusCode: 202, // Accepted, processing will continue in background
+      statusCode: 202,
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ jobId, status: 'processing' })
     };
@@ -101,11 +106,11 @@ export async function handler(event, context) {
       }).catch(err => console.error(`Failed to update error status: ${err}`));
     }
 
-    // Clean up if file exists
-    try {
-      if (file && file.path) await cleanupFiles(file.path);
-    } catch (cleanupError) {
-      console.error(`Cleanup failed: ${cleanupError}`);
+    // Clean up if tempFilePath exists
+    if (tempFilePath) {
+      await cleanupFiles(tempFilePath).catch(cleanupError => {
+        console.error(`Cleanup failed: ${cleanupError}`);
+      });
     }
 
     return {

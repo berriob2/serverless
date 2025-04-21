@@ -11,25 +11,20 @@
     "start": "node scripts/start-local.js",
     "init-local": "node scripts/init-local.js",
     "offline": "serverless offline start --config serverless-offline.yml",
-    "install-python-deps": "pip install -r requirements.txt"
+    "install-python-deps": "pip install -r requirements.txt",
+    "clean:powershell": "powershell -Command \"Remove-Item -Path .esbuild, .serverless -Recurse -Force -ErrorAction SilentlyContinue\""
   },
   "dependencies": {
-    "@aws-sdk/client-dynamodb": "^3.400.0",
-    "@aws-sdk/client-s3": "^3.400.0",
-    "@aws-sdk/client-ssm": "^3.400.0",
-    "@aws-sdk/lib-dynamodb": "^3.400.0",
-    "@aws-sdk/s3-request-presigner": "^3.400.0",
-    "file-type": "^18.5.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "jsonwebtoken": "^9.0.0",
-    "pdf-lib": "^1.17.1",
+    "@aws-sdk/client-s3": "^3.0.0",
+    "@aws-sdk/client-dynamodb": "^3.0.0",
     "rimraf": "^5.0.1",
-    "sharp": "^0.32.5",
-    "superagent": "^9.0.0",
+    "file-type": "^18.5.0",
     "uuid": "^9.0.0"
   },
   "devDependencies": {
+    "esbuild": "^0.25.2",
     "serverless": "^4.12.0",
+    "serverless-esbuild": "^1.55.0",
     "serverless-offline": "^14.4.0"
   },
   "engines": {

@@ -38,7 +38,7 @@ function generatePolicy(principalId, effect, resource) {
  * @param {object} context - Lambda context
  * @returns {Promise<object>} - IAM policy or throws error
  */
-exports.handler = async (event, context) => {
+export const handler = async (event, context) => {
   console.log('Authorizer event:', JSON.stringify(event, null, 2));
 
   try {

@@ -1,0 +1,258 @@
+# Build stage
+FROM public.ecr.aws/lambda/nodejs:18 AS builder
+
+WORKDIR /build
+
+# Install build tools & Python dependencies
+RUN yum install -y \
+    bzip2-devel \
+    gcc \
+    gzip \
+    libffi-devel \
+    libjpeg-devel \
+    libpng-devel \
+    make \
+    openssl-devel \
+    tar \
+    wget \
+    zlib-devel \
+    && yum clean all
+
+# Install Python 3.8
+RUN wget https://www.python.org/ftp/python/3.8.12/Python-3.8.12.tgz \
+    && tar -xzf Python-3.8.12.tgz \
+    && cd Python-3.8.12 \
+    && ./configure --enable-optimizations \
+    && make altinstall \
+    && cd .. \
+    && rm -rf Python-3.8.12 Python-3.8.12.tgz
+
+# Install pip
+RUN curl -O https://bootstrap.pypa.io/get-pip.py \
+    && /usr/local/bin/python3.8 get-pip.py \
+    && rm -rf get-pip.py
+
+# Install Python dependencies
+COPY requirements.txt .
+RUN /usr/local/bin/python3.8 -m pip install --no-cache-dir -r requirements.txt -t /build/python
+
+# Install Node.js dependencies
+COPY package.json package-lock.json ./
+RUN npm ci --production
+
+# Create a package.json in the functions directory to specify CommonJS
+RUN mkdir -p /build/functions
+RUN echo '{"type": "commonjs"}' > /build/functions/package.json
+
+# Copy Python script
+COPY functions/pdf_to_word.py /build/functions/
+
+# Create a separate file for the handler instead of using echo
+RUN echo 'module.exports.handler = async (event) => {
+  const fs = require("fs");
+  const path = require("path");
+  const { spawn } = require("child_process");
+  const { S3Client, GetObjectCommand, PutObjectCommand } = require("@aws-sdk/client-s3");
+  const { DynamoDBClient } = require("@aws-sdk/client-dynamodb");
+  const { DynamoDBDocumentClient, UpdateCommand } = require("@aws-sdk/lib-dynamodb");
+  
+  // Configuration
+  const TMP_DIR = process.env.TMP_DIR || "/tmp";
+  const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
+  
+  // Initialize clients
+  const s3Client = new S3Client({ region: process.env.AWS_REGION || "mx-central-1" });
+  const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || "mx-central-1" });
+  const docClient = DynamoDBDocumentClient.from(dynamoClient);
+  
+  // Helper functions
+  async function downloadFromS3(key, localPath, bucket) {
+    const command = new GetObjectCommand({
+      Bucket: bucket,
+      Key: key
+    });
+    const response = await s3Client.send(command);
+    const writeStream = fs.createWriteStream(localPath);
+    response.Body.pipe(writeStream);
+    
+    return new Promise((resolve, reject) => {
+      writeStream.on("finish", resolve);
+      writeStream.on("error", reject);
+    });
+  }
+  
+  async function uploadToS3(localPath, key, bucket) {
+    const fileContent = fs.readFileSync(localPath);
+    const command = new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: fileContent,
+      ContentType: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    });
+    return s3Client.send(command);
+  }
+  
+  async function updateJob(jobId, updates) {
+    const command = new UpdateCommand({
+      TableName: process.env.JOBS_TABLE_NAME,
+      Key: { jobId },
+      UpdateExpression: "set " + Object.keys(updates).map(k => `#${k} = :${k}`).join(", "),
+      ExpressionAttributeNames: Object.keys(updates).reduce((acc, k) => {
+        acc[`#${k}`] = k;
+        return acc;
+      }, {}),
+      ExpressionAttributeValues: Object.keys(updates).reduce((acc, k) => {
+        acc[`:${k}`] = updates[k];
+        return acc;
+      }, {})
+    });
+    return docClient.send(command);
+  }
+  
+  async function cleanupFiles(...filePaths) {
+    for (const filePath of filePaths) {
+      if (fs.existsSync(filePath)) {
+        fs.unlinkSync(filePath);
+      }
+    }
+  }
+  
+  const record = event.Records[0];
+  const bucket = record.s3.bucket.name;
+  const s3InputKey = decodeURIComponent(record.s3.object.key.replace(/\\+/g, " "));
+  const jobId = s3InputKey.split("/")[1].split(".")[0];
+  
+  // Ensure tmp directory exists
+  if (!fs.existsSync(TMP_DIR)) {
+    fs.mkdirSync(TMP_DIR, { recursive: true });
+  }
+  
+  const localInputPath = `${TMP_DIR}/${jobId}_input.pdf`;
+  const outputPath = `${TMP_DIR}/${jobId}.docx`;
+  const s3OutputKey = `output/${jobId}.docx`;
+  
+  try {
+    // Update job status
+    await updateJob(jobId, { status: "processing", progress: 20 });
+  
+    // Download PDF from S3
+    await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
+  
+    // Convert PDF to Word using Python script
+    const sanitizedInputPath = path.normalize(localInputPath).replace(/\\\\+/g, "/").replace(/[\\s&;$<>]/g, "");
+    const sanitizedOutputPath = path.normalize(outputPath).replace(/\\\\+/g, "/").replace(/[\\s&;$<>]/g, "");
+    const pythonScriptPath = path.join(process.env.LAMBDA_TASK_ROOT, "functions/pdf_to_word.py");
+    const pythonProcess = spawn("python3.8", [
+      pythonScriptPath,
+      sanitizedInputPath,
+      sanitizedOutputPath,
+    ]);
+  
+    // Set timeout (4 minutes)
+    const processTimeout = setTimeout(() => {
+      pythonProcess.kill();
+      throw new Error("PDF to Word conversion timed out");
+    }, 240000);
+  
+    // Process stdout and stderr
+    let stderrData = "";
+  
+    pythonProcess.stdout.on("data", (data) => {
+      console.log(`Job ${jobId} stdout: ${data}`);
+    });
+  
+    pythonProcess.stderr.on("data", (data) => {
+      const message = data.toString();
+      stderrData += message;
+      console.error(`Job ${jobId} stderr: ${message}`);
+    });
+  
+    // Handle process completion
+    await new Promise((resolve, reject) => {
+      pythonProcess.on("close", async (code) => {
+        clearTimeout(processTimeout);
+        console.log(`Job ${jobId}: Python process exited with code ${code}`);
+  
+        try {
+          if (code !== 0) {
+            console.error(`Job ${jobId}: Conversion failed with code ${code}`);
+            console.error(`stderr: ${stderrData}`);
+            throw new Error(`Conversion failed with code ${code}`);
+          }
+  
+          // Check if output file exists
+          if (!fs.existsSync(outputPath)) {
+            throw new Error("Output file was not created");
+          }
+  
+          // Update progress after conversion
+          await updateJob(jobId, { progress: 80 });
+          resolve();
+        } catch (err) {
+          reject(err);
+        }
+      });
+  
+      pythonProcess.on("error", (error) => {
+        clearTimeout(processTimeout);
+        console.error(`Job ${jobId}: Python process error: ${error}`);
+        reject(error);
+      });
+    });
+  
+    // Upload output to S3
+    await updateJob(jobId, { status: "uploading", progress: 95 });
+    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
+  
+    // Update job to completed
+    await updateJob(jobId, {
+      status: "completed",
+      progress: 100,
+      s3OutputKey,
+      originalName: path.basename(s3InputKey, ".pdf"),
+      conversionType: "pdf-to-word",
+      completedAt: new Date().toISOString(),
+    });
+  
+    // Clean up local files
+    await cleanupFiles(localInputPath, outputPath);
+  
+    return { statusCode: 200, body: "Conversion completed" };
+  } catch (error) {
+    console.error(`Error processing job ${jobId}: ${error.message}`);
+  
+    // Update job status to failed
+    await updateJob(jobId, {
+      status: "failed",
+      error: error.message,
+      progress: 0,
+    }).catch(err => console.error(`Failed to update error status: ${err}`));
+  
+    // Clean up
+    await cleanupFiles(localInputPath, outputPath).catch(cleanupError => {
+      console.error(`Cleanup failed: ${cleanupError}`);
+    });
+  
+    throw error; // Let Lambda retry if needed
+  }
+};' > /build/functions/processPdfToWord.js
+
+# Final stage - ensure we're using the x86_64 Lambda image
+FROM public.ecr.aws/lambda/nodejs:18-x86_64
+
+WORKDIR ${LAMBDA_TASK_ROOT}
+
+# Copy Python and Node.js dependencies
+COPY --from=builder /build/python ${LAMBDA_TASK_ROOT}/python
+COPY --from=builder /build/node_modules ${LAMBDA_TASK_ROOT}/node_modules
+
+# Copy function code
+COPY --from=builder /build/functions/ ${LAMBDA_TASK_ROOT}/functions/
+
+# Set environment variables for Python
+ENV PYTHONPATH=${LAMBDA_TASK_ROOT}/python
+ENV PATH=${LAMBDA_TASK_ROOT}/python/bin:${PATH}
+ENV NODE_OPTIONS="--no-warnings"
+
+# Set the handler - make sure this matches exactly what AWS Lambda expects
+CMD ["functions/processPdfToWord.handler"]
