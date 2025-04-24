@@ -76,7 +76,18 @@ provider:
           - public.ecr.aws/lambda/nodejs:18
         buildOptions:
           - --provenance=false
-
+      word-to-pdf:
+        path: ./
+        file: word-to-pdf/Dockerfile  # Specify the Dockerfile explicitly
+        platform: linux/amd64
+        buildArgs:
+          STAGE: ${opt:stage, 'dev'}
+          DOCKER_BUILDKIT: 1
+          BUILDKIT_INLINE_CACHE: 1
+        cacheFrom:
+          - public.ecr.aws/lambda/nodejs:18
+        buildOptions:
+          - --provenance=false
 custom:
   bucketName: ${self:service}-${self:provider.stage}-uploads-${self:provider.region}-${aws:accountId}
   esbuild:
@@ -105,6 +116,50 @@ custom:
       - jsonwebtoken
 
 functions:
+  convertPdfToWord:
+    handler: functions/convertPdfToWord.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
+    events:
+      - http:
+          path: convert/pdf-to-word
+          method: post
+          cors: true
+
+  convertWordToPdf:
+    handler: functions/convertWordtoPdf.handler
+    package:
+      individually: true
+      exclude:
+        - functions/python/**
+        - node_modules/**
+        - lambda-layers/**
+        - .esbuild/**
+        - ".git/**"
+        - "test/**"
+        - "**/*.test.js"
+        - "**/*.md"
+        - "**/*.txt"
+    layers:
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
+    events:
+      - http:
+          path: convert/word-to-pdf
+          method: post
+          cors: true
+
   convertHeicToJpg:
     handler: functions/convertHeicToJpg.handler
     package:
@@ -339,7 +394,8 @@ functions:
         - "**/*.md"
         - "**/*.txt"
     layers:
-      - arn:aws:lambda:mx-central-1:167603795381:layer:process-heic-depend:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-heic-depend:2
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - s3:
           bucket: ${self:custom.bucketName}
@@ -365,7 +421,8 @@ functions:
         - "**/*.md"
         - "**/*.txt"
     layers:
-      - arn:aws:lambda:mx-central-1:167603795381:layer:process-pdf-image:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-pdf-image:2
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - s3:
           bucket: ${self:custom.bucketName}
@@ -393,7 +450,7 @@ functions:
         - "**/*.txt"
     layers:
       - arn:aws:lambda:mx-central-1:167603795381:layer:FFmpegLayer:1
-      - arn:aws:lambda:mx-central-1:167603795381:layer:process-video-video2mp3:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:process-video-video2mp3:2
     events:
       - s3:
           bucket: ${self:custom.bucketName}
@@ -447,6 +504,7 @@ functions:
         - "**/*.txt"
     layers:
       - arn:aws:lambda:mx-central-1:167603795381:layer:process-extract-remove-pdf-pages:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - s3:
           bucket: ${self:custom.bucketName}
@@ -473,6 +531,7 @@ functions:
         - "**/*.txt"
     layers:
       - arn:aws:lambda:mx-central-1:167603795381:layer:process-extract-remove-pdf-pages:1
+      - arn:aws:lambda:mx-central-1:167603795381:layer:convert-heic2jpg-depend:4
     events:
       - s3:
           bucket: ${self:custom.bucketName}
@@ -500,6 +559,26 @@ functions:
           rules:
             - prefix: pdf-to-word/
             - suffix: .pdf
+    ephemeralStorageSize: 1024
+
+  processWordToPdf:
+    image:
+      name: word-to-pdf
+    timeout: 900
+    memorySize: 2048
+    architecture: x86_64
+    environment:
+      AWS_BUCKET_NAME: ${self:custom.bucketName}
+      TMP_DIR: /tmp
+      JOBS_TABLE_NAME: ${self:service}-${self:provider.stage}-jobs
+    events:
+      - s3:
+          bucket: ${self:custom.bucketName}
+          event: s3:ObjectCreated:*
+          existing: true
+          rules:
+            - prefix: word-to-pdf/
+            - suffix: .docx
     ephemeralStorageSize: 1024
 
 resources:

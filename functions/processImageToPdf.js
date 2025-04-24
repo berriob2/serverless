@@ -1,28 +1,56 @@
 /**
  * Process images to PDF conversion in background
  */
-import fs from 'fs';
-import path from 'path';
-import PDFDocument from 'pdfkit';
+const fs = require('fs');
+const path = require('path');
+const PDFDocument = require('pdfkit');
+const { S3Client } = require('@aws-sdk/client-s3');
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient } = require('@aws-sdk/lib-dynamodb');
 
-import { uploadToS3, downloadFromS3 } from '../lib/s3.js';
-import { cleanupFiles } from '../lib/cleanup.js';
-import { updateJob } from '../lib/dynamodb.js';
+const s3Helpers = require('../lib/s3.js');
+const { cleanupFiles } = require('../lib/cleanup.js');
+const { updateJob, getJob } = require('../lib/dynamodb.js');
 
 // Configuration
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
 const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
+
+// Initialize clients
+const s3Client = new S3Client({ region: process.env.AWS_REGION || 'mx-central-1' });
+const dynamoClient = new DynamoDBClient({ region: process.env.AWS_REGION || 'mx-central-1' });
+const docClient = DynamoDBDocumentClient.from(dynamoClient);
 
 /**
  * Process images to PDF conversion triggered by S3 event
  * @param {object} event - S3 event
  * @returns {Promise<object>} - Response
  */
-export async function handler(event) {
+exports.handler = async function(event) {
   const record = event.Records[0];
   const bucket = record.s3.bucket.name;
-  const s3TriggerKey = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
-  const jobId = s3TriggerKey.split('/')[1]; // e.g., images/<jobId>/<filename>
+  const s3InputKey = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
+  
+  // Extract jobId from the S3 key - support both formats:
+  // 1. image-to-pdf/<jobId>.jpg (single file trigger)
+  // 2. images/<jobId>/<filename> (folder structure)
+  let jobId;
+  if (s3InputKey.startsWith('image-to-pdf/')) {
+    jobId = s3InputKey.split('/')[1].split('.')[0];
+  } else if (s3InputKey.startsWith('images/')) {
+    const parts = s3InputKey.split('/');
+    if (parts.length >= 2) {
+      jobId = parts[1];
+    }
+  } else {
+    console.log(`Unrecognized S3 key format: ${s3InputKey}`);
+    return { statusCode: 400, body: 'Invalid S3 key format' };
+  }
+
+  if (!jobId) {
+    console.error('Could not extract jobId from S3 key:', s3InputKey);
+    return { statusCode: 400, body: 'Could not extract jobId' };
+  }
 
   // Ensure tmp directory exists
   if (!fs.existsSync(TMP_DIR)) {
@@ -31,19 +59,44 @@ export async function handler(event) {
 
   const outputPath = `${TMP_DIR}/${jobId}.pdf`;
   const s3OutputKey = `output/${jobId}.pdf`;
+  let inputPaths = [];
 
   try {
+    // Update job status
+    await updateJob(jobId, { status: 'processing', progress: 20 });
+
     // Fetch job details to get all input keys
-    const job = await updateJob(jobId, { status: 'processing', progress: 20 }); // Assuming updateJob returns current item
-    if (!job || !job.s3InputKeys) {
-      throw new Error('Job not found or missing input keys');
+    const job = await getJob(jobId);
+    console.log(`Job details for ${jobId}:`, JSON.stringify(job));
+    
+    let s3InputKeys = [];
+    
+    // Handle different job structures
+    if (job && job.s3InputKeys && Array.isArray(job.s3InputKeys)) {
+      // Standard format with array of input keys
+      s3InputKeys = job.s3InputKeys;
+    } else if (job && job.s3InputKey) {
+      // Alternative format with single input key
+      s3InputKeys = [job.s3InputKey];
+    } else if (s3InputKey) {
+      // Fallback: use the triggering S3 key itself
+      s3InputKeys = [s3InputKey];
+      
+      // Update the job with this key if possible
+      if (job) {
+        await updateJob(jobId, { s3InputKeys: [s3InputKey] });
+      }
     }
-    const s3InputKeys = job.s3InputKeys;
-    const inputPaths = s3InputKeys.map(key => `${TMP_DIR}/${jobId}_${path.basename(key)}`);
+    
+    if (s3InputKeys.length === 0) {
+      throw new Error(`No input files found for job ${jobId}`);
+    }
+    
+    inputPaths = s3InputKeys.map(key => `${TMP_DIR}/${jobId}_${path.basename(key)}`);
 
     // Download all images from S3
     for (let i = 0; i < s3InputKeys.length; i++) {
-      await downloadFromS3(s3InputKeys[i], inputPaths[i], BUCKET_NAME);
+      await s3Helpers.downloadFromS3(s3InputKeys[i], inputPaths[i], BUCKET_NAME);
     }
 
     // Create PDF document
@@ -74,7 +127,8 @@ export async function handler(event) {
     await new Promise((resolve) => writeStream.on('finish', resolve));
 
     // Upload output to S3
-    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
+    await updateJob(jobId, { status: 'uploading', progress: 95 });
+    await s3Helpers.uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
 
     // Update job to completed
     await updateJob(jobId, {
@@ -100,11 +154,15 @@ export async function handler(event) {
       progress: 0
     }).catch(err => console.error(`Failed to update error status: ${err}`));
 
-    // Clean up
-    await cleanupFiles(outputPath, ...inputPaths).catch(cleanupError => {
+    // Clean up safely
+    const filesToClean = [outputPath];
+    if (inputPaths.length > 0) {
+      filesToClean.push(...inputPaths);
+    }
+    await cleanupFiles(...filesToClean).catch(cleanupError => {
       console.error(`Cleanup failed: ${cleanupError}`);
     });
 
     throw error; // Let Lambda retry if needed
   }
-}
+};

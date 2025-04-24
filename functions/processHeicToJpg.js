@@ -1,13 +1,13 @@
 /**
  * Process HEIC to JPG conversion in background
  */
-import fs from 'fs';
-import path from 'path';
-import convert from 'heic-convert';
+const fs = require('fs');
+const path = require('path');
+const convert = require('heic-convert');
 
-import { uploadToS3, downloadFromS3 } from '../lib/s3.js';
-import { cleanupFiles } from '../lib/cleanup.js';
-import { updateJob } from '../lib/dynamodb.js';
+const { uploadToS3, downloadFromS3 } = require('../lib/s3.js');
+const { cleanupFiles } = require('../lib/cleanup.js');
+const { updateJob } = require('../lib/dynamodb.js');
 
 // Configuration
 const TMP_DIR = process.env.TMP_DIR || '/tmp';
@@ -18,7 +18,7 @@ const BUCKET_NAME = process.env.AWS_BUCKET_NAME;
  * @param {object} event - S3 event
  * @returns {Promise<object>} - Response
  */
-export async function handler(event) {
+exports.handler = async function(event) {
   const record = event.Records[0];
   const bucket = record.s3.bucket.name;
   const s3InputKey = decodeURIComponent(record.s3.object.key.replace(/\+/g, ' '));
@@ -85,4 +85,4 @@ export async function handler(event) {
 
     throw error; // Let Lambda retry if needed
   }
-}
+};
