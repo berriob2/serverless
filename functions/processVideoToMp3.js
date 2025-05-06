@@ -47,7 +47,7 @@ export async function handler(event) {
     const quality = job.quality;
 
     outputPath = `${TMP_DIR}/${jobId}.${outputFormat}`;
-    s3OutputKey = `output/${jobId}.${outputFormat}`;
+    s3OutputKey = `converted/${jobId}.${outputFormat}`;
 
     // Download video from S3
     await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
