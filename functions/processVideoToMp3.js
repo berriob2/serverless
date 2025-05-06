@@ -47,7 +47,7 @@ export async function handler(event) {
     const quality = job.quality;
 
     outputPath = `${TMP_DIR}/${jobId}.${outputFormat}`;
-    s3OutputKey = `converted/${jobId}.${outputFormat}`;
+    s3OutputKey = `converted/${jobId}.${outputFormat}`; // Ensure 'converted' aligns with the updated S3 structure
 
     // Download video from S3
     await downloadFromS3(s3InputKey, localInputPath, BUCKET_NAME);
@@ -94,13 +94,13 @@ export async function handler(event) {
 
     // Upload output to S3
     await updateJob(jobId, { status: 'uploading', progress: 95 });
-    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME);
+    await uploadToS3(outputPath, s3OutputKey, BUCKET_NAME); // Confirm downstream systems expect 'converted' prefix
 
     // Update job to completed
     await updateJob(jobId, {
       status: 'completed',
       progress: 100,
-      s3OutputKey,
+      s3OutputKey, // Ensure downstream dependencies handle 'converted' prefix correctly
       originalName: path.basename(s3InputKey, path.extname(s3InputKey)),
       conversionType: 'video-to-mp3',
       completedAt: new Date().toISOString()
